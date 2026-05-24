@@ -15,6 +15,14 @@ def parse_args():
     parser = argparse.ArgumentParser("FSPNet-Transformer")
     parser.add_argument('--base_lr', default=(1e-4), type=float, help='learning rate')
     parser.add_argument('--batch_size_per_gpu', default=3, type=int, help='batch size per GPU')
+    parser.add_argument('--epochs', default=100, type=int, help='number of epochs')
+    parser.add_argument('--img_size', default=384, type=int, help='input image size (square)')
+    parser.add_argument('--num_workers', default=2, type=int, help='dataloader workers')
+    parser.add_argument('--output_dir', default='./checkpoints', type=str, help='where to save checkpoints')
+    parser.add_argument('--save_every', default=2, type=int, help='save every N epochs')
+    parser.add_argument('--save_after', default=30, type=int, help='start saving after this epoch')
+    parser.add_argument('--amp', action='store_true', help='use mixed precision training')
+    parser.add_argument('--accum_steps', default=1, type=int, help='gradient accumulation steps')
     parser.add_argument("--resume", default=None)
     parser.add_argument('--gpu', default=None, type=int)
     parser.add_argument('--path', type=str, help='path to train dataset')
@@ -42,6 +50,9 @@ def main(args):
     args.distributed = args.world_size > 1
     ngpus_per_node = torch.cuda.device_count()
 
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this training script.")
+
     if args.distributed:
         if args.local_rank != -1: # for torch.distributed.launch
             args.rank = args.local_rank
@@ -53,31 +64,31 @@ def main(args):
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
 
+    # Single-GPU fallback
+    if not args.distributed:
+        args.rank = 0
+        if args.gpu is None:
+            args.gpu = 0
+
     # suppress printing if not on master gpu
-    if args.rank!=0:
+    if args.rank != 0:
         def print_pass(*args):
             pass
         builtins.print = print_pass
        
     ### model ###
-    net = FSPNet_model.Model(args.pretrain, img_size=384)
-    net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)
+    net = FSPNet_model.Model(args.pretrain, img_size=args.img_size)
+    device = torch.device(f"cuda:{args.gpu}")
+    torch.cuda.set_device(device)
+    net = net.to(device)
+
     if args.distributed:
-        # For multiprocessing distributed, DistributedDataParallel constructor
-        # should always set the single device scope, otherwise,
-        # DistributedDataParallel will use all available devices.
+        net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)
         os.system("nvidia-smi")
-        if args.gpu is not None:
-            torch.cuda.set_device(args.gpu)
-            net.cuda(args.gpu)
-            net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[args.gpu])
-            model_without_ddp = net.module
-        else:
-            net.cuda()
-            net = torch.nn.parallel.DistributedDataParallel(net)
-            model_without_ddp = net.module
+        net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[args.gpu])
+        model_without_ddp = net.module
     else:
-        raise NotImplementedError("Only DistributedDataParallel is supported.")
+        model_without_ddp = net
         
     ### optimizer ###
     
@@ -109,39 +120,61 @@ def main(args):
     ### data ###
     Dir = [args.path]
     Dataset = dataset.TrainDataset(Dir)
-    Datasampler = torch.utils.data.distributed.DistributedSampler(Dataset, shuffle=True)
-    Dataloader = DataLoader(Dataset, batch_size=args.batch_size_per_gpu, num_workers=1, collate_fn=dataset.my_collate_fn, sampler=Datasampler, drop_last=True)
+    if args.distributed:
+        Datasampler = torch.utils.data.distributed.DistributedSampler(Dataset, shuffle=True)
+        shuffle = False
+    else:
+        Datasampler = None
+        shuffle = True
+    collate_fn = lambda batch: dataset.my_collate_fn(batch, size=args.img_size)
+    Dataloader = DataLoader(
+        Dataset,
+        batch_size=args.batch_size_per_gpu,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn,
+        sampler=Datasampler,
+        shuffle=shuffle,
+        drop_last=True,
+        pin_memory=True,
+    )
     
     # torch.backends.cudnn.benchmark = True
     
     ### main loop ###
     star_time=time.time()
-    for curr_epoch in range(0, 101):
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+
+    for curr_epoch in range(0, args.epochs + 1):
         
         if curr_epoch==50 or curr_epoch==75:
             for param_group in optimizer.param_groups:
                 param_group['lr']= param_group['lr']*0.1
                 print("Learning rate:", param_group['lr'])
-        Datasampler.set_epoch(curr_epoch)
+        if Datasampler is not None:
+            Datasampler.set_epoch(curr_epoch)
         net.train()
         running_loss_all, running_loss_m , running_loss_edge= 0., 0., 0.
         count = 0
         for data in Dataloader:
             count += 1
-            img, label = data['img'].cuda(args.rank), data['label'].cuda(args.rank)
-            edge = data['edge'].cuda(args.rank)  # Load the edge map
+            img = data['img'].to(device, non_blocking=True)
+            label = data['label'].to(device, non_blocking=True)
+            edge = data['edge'].to(device, non_blocking=True)
 
-            mask_out, edge_out = net(img)
-            # Compute losses
-            all_loss = loss.structure_loss(mask_out, label)
-            edge_loss = loss.multi_edge_loss(edge_out, edge)  # Compute edge loss
+            with torch.cuda.amp.autocast(enabled=args.amp):
+                mask_out, edge_out = net(img)
+                all_loss = loss.structure_loss(mask_out, label)
+                edge_loss = loss.multi_edge_loss(edge_out, edge)
+                total_loss = (all_loss + edge_loss) / max(args.accum_steps, 1)
 
-            # Total loss: combine the mask and edge loss
-            total_loss = all_loss + edge_loss
+            if count % max(args.accum_steps, 1) == 1:
+                optimizer.zero_grad(set_to_none=True)
 
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
+            scaler.scale(total_loss).backward()
+
+            if count % max(args.accum_steps, 1) == 0:
+                scaler.step(optimizer)
+                scaler.update()
 
             running_loss_all += all_loss.item()
             running_loss_edge += edge_loss.item()
@@ -150,11 +183,10 @@ def main(args):
                 print("Epoch:{}, Iter:{}, all_loss:{:.5f}, edge_loss:{:.5f}".format(
                     curr_epoch, count, running_loss_all / count, running_loss_edge / count))
 
-        if args.rank == 0 and curr_epoch % 2 == 0 and curr_epoch>29:
-            ckpt_save_root = "/mnt/scratch/scrmat/edgeoptim2_checkpoints"
-            os.makedirs(ckpt_save_root, exist_ok=True)
-            ckpt_save_path = f"{ckpt_save_root}/model_{curr_epoch}.pth"
-            torch.save(net.state_dict(), ckpt_save_path)
+        if args.rank == 0 and curr_epoch >= args.save_after and (curr_epoch % args.save_every == 0):
+            os.makedirs(args.output_dir, exist_ok=True)
+            ckpt_save_path = os.path.join(args.output_dir, f"model_{curr_epoch}.pth")
+            torch.save(model_without_ddp.state_dict(), ckpt_save_path)
 
 if __name__ == '__main__':
     args = parse_args()

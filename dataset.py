@@ -70,8 +70,7 @@ class TrainDataset(Dataset):
                 "edge":torch.from_numpy(edge).permute(2,0,1).unsqueeze(0)}
 
 
-def my_collate_fn(batch):
-    size = 384
+def my_collate_fn(batch, size=384):
     imgs=[]
     labels=[]
     edges=[]
