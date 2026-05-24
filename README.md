@@ -105,7 +105,7 @@ Checkpoints will be saved under `/kaggle/working/checkpoints/`.
 
 ### 5) Testing
 
-`test.py` currently has test dataset roots hardcoded inside the file. For Kaggle/Colab, edit them or adapt `test.py` to point to your attached test datasets.
+`test.py` supports `--data_roots` to pass test dataset roots from the command line (recommended for Kaggle/Colab).
   
 
 ## Results

@@ -64,27 +64,49 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run FSPNet model on datasets.")
     parser.add_argument("--ckpt_path", required=True, help="Path to checkpoint.")
     parser.add_argument("--result_save_root", required=True, help="Path to save the results.")
+    parser.add_argument(
+        "--data_roots",
+        nargs='+',
+        default=None,
+        help="One or more dataset roots, each containing images/ and masks/",
+    )
+    parser.add_argument("--img_size", type=int, default=384, help="Inference resize size (square)")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Binarization threshold")
+    parser.add_argument("--num_workers", type=int, default=2, help="Dataloader workers")
     args = parser.parse_args()
 
     batch_size = 1
-    net = FSPNet_model.Model(None, img_size=384).cuda()
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for inference.")
+    net = FSPNet_model.Model(None, img_size=args.img_size).cuda()
 
     # Load checkpoint
     ckpt_path = args.ckpt_path
-    pretrained_dict = torch.load(ckpt_path)
-    net_dict = net.state_dict()
-    pretrained_dict = {k[7:]: v for k, v in pretrained_dict.items() if k[7:] in net_dict}
-    net_dict.update(pretrained_dict)
-    net.load_state_dict(net_dict)
+    state_dict = torch.load(ckpt_path, map_location='cpu')
+
+    # Handle both DDP checkpoints (keys start with 'module.') and non-DDP checkpoints.
+    if isinstance(state_dict, dict) and any(k.startswith('module.') for k in state_dict.keys()):
+        state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
+
+    missing, unexpected = net.load_state_dict(state_dict, strict=False)
+    if len(unexpected) > 0:
+        print(f"[WARN] Unexpected keys in checkpoint: {len(unexpected)}")
+    if len(missing) > 0:
+        print(f"[WARN] Missing keys when loading checkpoint: {len(missing)}")
     net.eval()
 
     # Test datasets
-    Dirs = [
-        "/mnt/scratch/scrmat/PolypData/kvasir_ses/",
-        "/mnt/scratch/scrmat/PolypData/Etis_Larib/",
-        "/mnt/scratch/scrmat/PolypData/CVC-ColonDB/",
-        "/mnt/scratch/scrmat/PolypData/C6/"
-    ]
+    if args.data_roots is not None:
+        Dirs = args.data_roots
+    else:
+        # Default paths from the original training environment.
+        # For Kaggle/Colab, pass --data_roots.
+        Dirs = [
+            "/mnt/scratch/scrmat/PolypData/kvasir_ses/",
+            "/mnt/scratch/scrmat/PolypData/Etis_Larib/",
+            "/mnt/scratch/scrmat/PolypData/CVC-ColonDB/",
+            "/mnt/scratch/scrmat/PolypData/C6/"
+        ]
 
     metrics = ["meanIoU", "meanDice", "Smeasure", "wFmeasure", "MAE"]
     dataset_results = {}
@@ -96,8 +118,8 @@ if __name__ == '__main__':
         save_path = os.path.join(args.result_save_root, dataset_name)
         os.makedirs(save_path, exist_ok=True)
 
-        Dataset = dataset.TestDataset(dataset_dir, 384)
-        Dataloader = DataLoader(Dataset, batch_size=batch_size, num_workers=batch_size * 2)
+        Dataset = dataset.TestDataset(dataset_dir, args.img_size)
+        Dataloader = DataLoader(Dataset, batch_size=batch_size, num_workers=args.num_workers)
 
         gt_pth_lst = []
         pred_pth_lst = []
@@ -122,7 +144,7 @@ if __name__ == '__main__':
             B, C, H, W = label.size()
             o = F.interpolate(out, (H, W), mode='bilinear', align_corners=True).detach().cpu().numpy()[0, 0]
             o = (o - o.min()) / (o.max() - o.min() + 1e-8)
-            o_bin = (o > 0.5).astype(np.uint8)
+            o_bin = (o > args.threshold).astype(np.uint8)
             o_bin = (o_bin * 255).astype(np.uint8)
 
             pred_pth = os.path.join(save_path, name)

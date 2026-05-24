@@ -140,14 +140,17 @@ Checkpoints will be written to `--output_dir`.
 
 ## 6) Testing
 
-`test.py` currently contains hardcoded test dataset paths.
+`test.py` supports passing dataset roots from the command line.
 
-For Kaggle/Colab you should either:
-- Edit the `Dirs = [...]` list inside `test.py`, OR
-- Refactor `test.py` to accept `--data_roots` / `--data_root` as an argument.
+Each dataset root must contain `images/` and `masks/`.
 
-Current CLI usage:
+CLI usage:
 
 ```bash
-!python test.py --ckpt_path "/path/to/model_xx.pth" --result_save_root "/path/to/results"
+!python test.py \
+  --ckpt_path "/path/to/model_xx.pth" \
+  --result_save_root "/path/to/results" \
+  --data_roots "/path/to/dataset1" "/path/to/dataset2" \
+  --img_size 352 \
+  --threshold 0.5
 ```
