@@ -63,7 +63,7 @@ def edge_loss(pred, gt, threshold=0.5):
     gt_edges = gt_edges.float().clamp(0.0, 1.0)
 
     # BCE is blacklisted under autocast; explicitly disable autocast for this op.
-    with autocast('cuda', enabled=False):
+    with autocast(pred_edges.device.type, enabled=False):
         return F.binary_cross_entropy(pred_edges, gt_edges, reduction='mean')
 
     
