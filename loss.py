@@ -50,15 +50,18 @@ def structure_loss(preds, gt):
 
 
 def edge_loss(pred, gt, threshold=0.5):
-    
-    # Convert the ground truth (Canny edge map) to a binary mask
-    gt_edges = gt.float() / 255.0  # Convert Canny edges from [0, 255] to [0, 1]
-    
-    # Apply threshold to the predicted edges to create binary predictions
-    pred_edges = (pred > threshold).float()  # Binarize the predicted edges
+    # NOTE: For stable training and AMP compatibility, keep this loss differentiable.
+    # The dataset loader typically returns edge maps in [0, 1]. If edges are in [0,255], normalize.
+    gt_edges = gt.float()
+    if gt_edges.max() > 1.0:
+        gt_edges = gt_edges / 255.0
 
-    # Use BCE loss to compare binary edge maps
-    return bce(pred_edges, gt_edges)
+    # Model heads often output probabilities (after sigmoid). Use BCE on probabilities.
+    # Force float32 so BCE is safe even when forward is under autocast.
+    pred_edges = pred.float().clamp(1e-6, 1.0 - 1e-6)
+    gt_edges = gt_edges.float().clamp(0.0, 1.0)
+
+    return F.binary_cross_entropy(pred_edges, gt_edges, reduction='mean')
 
     
 def multi_edge_loss(preds, gt):

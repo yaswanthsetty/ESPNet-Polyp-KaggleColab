@@ -9,6 +9,7 @@ import time
 import FSPNet_model
 import dataset
 import loss
+from torch.amp import GradScaler, autocast
 
 
 def parse_args():
@@ -142,7 +143,7 @@ def main(args):
     
     ### main loop ###
     star_time=time.time()
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    scaler = GradScaler('cuda', enabled=args.amp)
 
     for curr_epoch in range(0, args.epochs + 1):
         
@@ -161,7 +162,7 @@ def main(args):
             label = data['label'].to(device, non_blocking=True)
             edge = data['edge'].to(device, non_blocking=True)
 
-            with torch.cuda.amp.autocast(enabled=args.amp):
+            with autocast('cuda', enabled=args.amp):
                 mask_out, edge_out = net(img)
                 all_loss = loss.structure_loss(mask_out, label)
                 edge_loss = loss.multi_edge_loss(edge_out, edge)
