@@ -22,6 +22,7 @@ def parse_args():
     parser.add_argument('--prefetch_factor', default=2, type=int, help='dataloader prefetch factor (workers > 0)')
     parser.add_argument('--persistent_workers', action='store_true', help='keep dataloader workers alive (workers > 0)')
     parser.add_argument('--cudnn_benchmark', action='store_true', help='enable cudnn benchmark for fixed-size inputs')
+    parser.add_argument('--log_every', default=20, type=int, help='log every N iterations (rank 0 only)')
     parser.add_argument('--output_dir', default='./checkpoints', type=str, help='where to save checkpoints')
     parser.add_argument('--save_every', default=2, type=int, help='save every N epochs')
     parser.add_argument('--save_after', default=30, type=int, help='start saving after this epoch')
@@ -168,6 +169,8 @@ def main(args):
     scaler = GradScaler('cuda', enabled=args.amp)
 
     for curr_epoch in range(args.epochs):
+        if args.rank == 0:
+            print(f"Epoch {curr_epoch + 1}/{args.epochs} start", flush=True)
         
         if curr_epoch==50 or curr_epoch==75:
             for param_group in optimizer.param_groups:
@@ -178,6 +181,7 @@ def main(args):
         net.train()
         running_loss_all, running_loss_m , running_loss_edge= 0., 0., 0.
         count = 0
+        epoch_start = time.time()
         for data in Dataloader:
             count += 1
             img = data['img'].to(device, non_blocking=True)
@@ -208,9 +212,21 @@ def main(args):
             running_loss_all += all_loss.item()
             running_loss_edge += edge_loss.item()
 
-            if count % 20 == 0 and args.rank == 0:
-                print("Epoch:{}, Iter:{}, all_loss:{:.5f}, edge_loss:{:.5f}".format(
-                    curr_epoch, count, running_loss_all / count, running_loss_edge / count))
+            if args.rank == 0 and (count == 1 or (args.log_every > 0 and count % args.log_every == 0)):
+                elapsed = max(time.time() - epoch_start, 1e-6)
+                it_s = elapsed / count
+                remaining = (len(Dataloader) - count) * it_s if hasattr(Dataloader, '__len__') else 0.0
+                print(
+                    "Epoch:{}, Iter:{}, all_loss:{:.5f}, edge_loss:{:.5f}, it/s:{:.2f}, eta(min):{:.1f}".format(
+                        curr_epoch,
+                        count,
+                        running_loss_all / count,
+                        running_loss_edge / count,
+                        1.0 / it_s,
+                        remaining / 60.0,
+                    ),
+                    flush=True,
+                )
 
         if args.rank == 0 and curr_epoch >= args.save_after and (curr_epoch % args.save_every == 0):
             os.makedirs(args.output_dir, exist_ok=True)
