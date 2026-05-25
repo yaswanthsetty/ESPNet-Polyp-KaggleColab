@@ -829,14 +829,14 @@ def deit_base_distilled_patch16_224(pretrained=False, **kwargs):
 
 
 @register_model
-def deit_base_distilled_patch16_384(pretrained=False, **kwargs):
+def deit_base_distilled_patch16_384(pretrained=False, img_size=384, **kwargs):
     """ DeiT-base distilled model @ 384x384 from paper (https://arxiv.org/abs/2012.12877).
     ImageNet-1k weights from https://github.com/facebookresearch/deit.
     """
     model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, drop_path_rate=0.1, **kwargs)
     # model = _create_vision_transformer(
     #     'deit_base_distilled_patch16_384', pretrained=pretrained, distilled=True, **model_kwargs)
-    model = VisionTransformer(img_size=384, patch_size=16, embed_dim=768, depth=12, num_heads=12, drop_path_rate=0.1, distilled=True,
+    model = VisionTransformer(img_size=img_size, patch_size=16, embed_dim=768, depth=12, num_heads=12, drop_path_rate=0.1, distilled=True,
                               norm_layer=nn.LayerNorm, act_layer=nn.GELU)
     return model
 

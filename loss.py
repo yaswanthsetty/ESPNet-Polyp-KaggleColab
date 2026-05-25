@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.amp import autocast
 
 #structure mask loss
 bce = nn.BCELoss(reduction='mean')
@@ -18,7 +19,7 @@ def single_structure_loss(pred, mask):
     loss function (ref: F3Net-AAAI-2020)
     """
     weit = 1 + 5 * torch.abs(F.avg_pool2d(mask, kernel_size=31, stride=1, padding=15) - mask)
-    wbce = F.binary_cross_entropy_with_logits(pred, mask, reduce='none')
+    wbce = F.binary_cross_entropy_with_logits(pred, mask, reduction='none')
     wbce = (weit * wbce).sum(dim=(2, 3)) / weit.sum(dim=(2, 3))
 
     # pred = torch.sigmoid(pred)
@@ -61,7 +62,9 @@ def edge_loss(pred, gt, threshold=0.5):
     pred_edges = pred.float().clamp(1e-6, 1.0 - 1e-6)
     gt_edges = gt_edges.float().clamp(0.0, 1.0)
 
-    return F.binary_cross_entropy(pred_edges, gt_edges, reduction='mean')
+    # BCE is blacklisted under autocast; explicitly disable autocast for this op.
+    with autocast('cuda', enabled=False):
+        return F.binary_cross_entropy(pred_edges, gt_edges, reduction='mean')
 
     
 def multi_edge_loss(preds, gt):

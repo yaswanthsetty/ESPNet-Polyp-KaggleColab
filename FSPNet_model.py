@@ -251,10 +251,22 @@ class EdgeFusion(nn.Module):
 class Model(nn.Module):
     def __init__(self, ckpt, img_size=384):
         super(Model, self).__init__()
-        self.encoder = vit.deit_base_distilled_patch16_384()
+        self.encoder = vit.deit_base_distilled_patch16_384(img_size=img_size)
         if ckpt is not None:
             ckpt = torch.load(ckpt, map_location='cpu')
-            msg = self.encoder.load_state_dict(ckpt["model"], strict=False)
+            state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+
+            # Resize position embeddings if checkpoint was trained at a different resolution.
+            if "pos_embed" in state_dict and state_dict["pos_embed"].shape != self.encoder.pos_embed.shape:
+                state_dict = dict(state_dict)
+                state_dict["pos_embed"] = vit.resize_pos_embed(
+                    state_dict["pos_embed"],
+                    self.encoder.pos_embed,
+                    getattr(self.encoder, 'num_tokens', 1),
+                    self.encoder.patch_embed.grid_size,
+                )
+
+            msg = self.encoder.load_state_dict(state_dict, strict=False)
             print("====================================")
             print(msg)
 
