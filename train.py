@@ -19,6 +19,9 @@ def parse_args():
     parser.add_argument('--epochs', default=100, type=int, help='number of epochs')
     parser.add_argument('--img_size', default=384, type=int, help='input image size (square)')
     parser.add_argument('--num_workers', default=2, type=int, help='dataloader workers')
+    parser.add_argument('--prefetch_factor', default=2, type=int, help='dataloader prefetch factor (workers > 0)')
+    parser.add_argument('--persistent_workers', action='store_true', help='keep dataloader workers alive (workers > 0)')
+    parser.add_argument('--cudnn_benchmark', action='store_true', help='enable cudnn benchmark for fixed-size inputs')
     parser.add_argument('--output_dir', default='./checkpoints', type=str, help='where to save checkpoints')
     parser.add_argument('--save_every', default=2, type=int, help='save every N epochs')
     parser.add_argument('--save_after', default=30, type=int, help='start saving after this epoch')
@@ -45,9 +48,14 @@ def parse_args():
     return args
                                          
 def main(args):
-    # DDP setting
+    # DDP setting (supports torchrun/torch.distributed.run)
     if "WORLD_SIZE" in os.environ:
         args.world_size = int(os.environ["WORLD_SIZE"])
+    if args.rank == -1 and "RANK" in os.environ:
+        args.rank = int(os.environ["RANK"])
+    if args.local_rank == -1 and "LOCAL_RANK" in os.environ:
+        args.local_rank = int(os.environ["LOCAL_RANK"])
+
     args.distributed = args.world_size > 1
     ngpus_per_node = torch.cuda.device_count()
 
@@ -55,13 +63,20 @@ def main(args):
         raise RuntimeError("CUDA is required for this training script.")
 
     if args.distributed:
-        if args.local_rank != -1: # for torch.distributed.launch
-            args.rank = args.local_rank
+        # Prefer torchrun env/configs
+        if args.local_rank != -1:
             args.gpu = args.local_rank
-        elif 'SLURM_PROCID' in os.environ: # for slurm scheduler
+            if args.rank == -1:
+                args.rank = args.local_rank
+        elif 'SLURM_PROCID' in os.environ:  # for slurm scheduler
             args.rank = int(os.environ['SLURM_PROCID'])
             args.gpu = args.rank % torch.cuda.device_count()
             print("args.rank = {}; args.gpu = {}".format(args.rank, args.gpu))
+        else:
+            # Fallback: single-process distributed misconfig protection
+            args.gpu = 0
+            if args.rank == -1:
+                args.rank = 0
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
 
@@ -70,6 +85,9 @@ def main(args):
         args.rank = 0
         if args.gpu is None:
             args.gpu = 0
+
+    if args.cudnn_benchmark:
+        torch.backends.cudnn.benchmark = True
 
     # suppress printing if not on master gpu
     if args.rank != 0:
@@ -85,7 +103,8 @@ def main(args):
 
     if args.distributed:
         net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)
-        os.system("nvidia-smi")
+        if args.rank == 0:
+            os.system("nvidia-smi")
         net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[args.gpu])
         model_without_ddp = net.module
     else:
@@ -128,8 +147,7 @@ def main(args):
         Datasampler = None
         shuffle = True
     collate_fn = lambda batch: dataset.my_collate_fn(batch, size=args.img_size)
-    Dataloader = DataLoader(
-        Dataset,
+    loader_kwargs = dict(
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
@@ -138,6 +156,10 @@ def main(args):
         drop_last=True,
         pin_memory=True,
     )
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = args.persistent_workers
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+    Dataloader = DataLoader(Dataset, **loader_kwargs)
     
     # torch.backends.cudnn.benchmark = True
     
@@ -145,7 +167,7 @@ def main(args):
     star_time=time.time()
     scaler = GradScaler('cuda', enabled=args.amp)
 
-    for curr_epoch in range(0, args.epochs + 1):
+    for curr_epoch in range(args.epochs):
         
         if curr_epoch==50 or curr_epoch==75:
             for param_group in optimizer.param_groups:
@@ -176,6 +198,12 @@ def main(args):
             if count % max(args.accum_steps, 1) == 0:
                 scaler.step(optimizer)
                 scaler.update()
+
+        # Handle remainder steps when dataset size isn't divisible by accum_steps
+        if count % max(args.accum_steps, 1) != 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
             running_loss_all += all_loss.item()
             running_loss_edge += edge_loss.item()
